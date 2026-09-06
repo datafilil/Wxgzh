@@ -76,7 +76,24 @@ jobs:
               items = items.get("list") or items.get("records") or []
           ids = [t.get("id") for t in items if t.get("id")]
           if not ids:
-              print("::warning::没有找到定时任务,请先在 WeRSS 界面创建消息任务")
+              print("::warning::没有消息任务, 改为按公众号列表逐个触发采集")
+              mps = json.loads(subprocess.run(
+                  ["curl", "-s",
+                   "-H", f"Authorization: Bearer {token}",
+                   "http://localhost:8001/api/v1/wx/mps?limit=50"],
+                  capture_output=True, text=True).stdout or "{}")
+              mitems = (mps.get("data") or {})
+              if isinstance(mitems, dict):
+                  mitems = mitems.get("list") or mitems.get("records") or []
+              for mp in mitems:
+                  mpid = mp.get("id")
+                  if mpid:
+                      print(f"触发采集: {mp.get('mp_name')} ({mpid})")
+                      subprocess.run([
+                          "curl", "-s",
+                          "-H", f"Authorization: Bearer {token}",
+                          f"http://localhost:8001/api/v1/wx/mps/update/{mpid}"
+                      ], capture_output=True)
           for tid in ids:
               print(f"触发采集: task {tid}")
               subprocess.run([
@@ -91,42 +108,47 @@ jobs:
       - name: 导出 RSS 为静态文件
         run: |
           mkdir -p site/rss
-          curl -s http://localhost:8001/api/v1/wx/rss -o rss_list.json || true
+          # 聚合订阅源(公开接口)
+          curl -sf http://localhost:8001/rss -o site/rss/all.xml || echo "::warning::聚合RSS导出失败"
+          # 按公众号列表逐个导出
           python3 - <<'EOF'
           import json, subprocess, pathlib, html
           site = pathlib.Path("site/rss")
-          try:
-              data = json.load(open("rss_list.json"))
-          except Exception as e:
-              print(f"::warning::RSS 列表解析失败: {e}"); raise SystemExit(0)
-          items = data.get("data") or []
+          token = open("token.txt").read().strip()
+          mps = json.loads(subprocess.run(
+              ["curl", "-s",
+               "-H", f"Authorization: Bearer {token}",
+               "http://localhost:8001/api/v1/wx/mps?limit=50"],
+              capture_output=True, text=True).stdout or "{}")
+          items = (mps.get("data") or {})
           if isinstance(items, dict):
               items = items.get("list") or items.get("records") or []
-          feeds = []
+          index = ["<html><head><meta charset='utf-8'><title>WeRSS 订阅源</title></head><body><h1>WeRSS RSS 订阅源</h1>",
+                   "<p>聚合源: <a href='rss/all.xml'>rss/all.xml</a> (推荐, 一个地址订全部)</p><ul>"]
           for it in items:
-              fid, name = it.get("id"), it.get("mp_name") or it.get("name") or str(it.get("id"))
-              if fid:
-                  feeds.append((str(fid), name))
-          index = ["<html><head><meta charset='utf-8'><title>WeRSS 订阅源</title></head><body><h1>WeRSS RSS 订阅源</h1><ul>"]
-          for fid, name in feeds:
+              if not isinstance(it, dict):
+                  continue
+              fid = it.get("id")
+              name = it.get("mp_name") or str(fid)
+              if not fid:
+                  continue
               r = subprocess.run(["curl", "-sf",
-                  f"http://localhost:8001/api/v1/wx/feed/{fid}.xml",
+                  f"http://localhost:8001/feed/{fid}.xml",
                   "-o", str(site / f"{fid}.xml")])
-              if r.returncode == 0 and (site / f"{fid}.xml").stat().st_size > 0:
-                  print(f"导出: {name} -> rss/{fid}.xml")
-                  index.append(f"<li><a href='rss/{fid}.xml'>{html.escape(name)}</a> "
-                               f"(<code>rss/{fid}.xml</code>)</li>")
+              ok = r.returncode == 0 and (site / f"{fid}.xml").exists() and (site / f"{fid}.xml").stat().st_size > 0
+              print(f"导出: {name} -> rss/{fid}.xml {'OK' if ok else 'FAIL'}")
+              if ok:
+                  index.append(f"<li>{html.escape(name)}: <a href='rss/{fid}.xml'>rss/{fid}.xml</a></li>")
           index.append("</ul></body></html>")
           pathlib.Path("site/index.html").write_text("\n".join(index), encoding="utf-8")
           EOF
-          ls -la site/rss || true
+          ls -la site site/rss || true
 
       - name: 发布 RSS 到 gh-pages(Pages 永久在线)
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./site
-          destination_dir: rss
           keep_files: false
           commit_message: "RSS 更新 ${{ github.event_name }} ${{ github.run_id }}"
         continue-on-error: true
