@@ -1,0 +1,151 @@
+# ============================================================
+# WeRSS 定时采集 + RSS 静态发布(GitHub Actions)
+# ------------------------------------------------------------
+# 触发时间:北京时间每天 06:55 与 19:06(UTC 22:55 / 11:06)
+# 免费额度:Public 仓库 Actions 不限量,不占用 Codespaces 额度
+#
+# 前置条件(见 DEPLOY-ACTIONS.md):
+#   1. 私有仓库 <你的用户名>/werss-data 存放 data/(SQLite+授权)
+#   2. Secrets:DATA_REPO_TOKEN(私有库读写 PAT)、WERSS_USER、WERSS_PASS
+#   3. 仓库 Settings → Pages → Source 选 gh-pages 分支
+# ============================================================
+name: WeRSS collect
+
+on:
+  schedule:
+    - cron: "55 22 * * *" # 北京时间 06:55
+    - cron: "6 11 * * *"  # 北京时间 19:06
+  workflow_dispatch: {}   # 支持手动触发,便于调试
+
+permissions:
+  contents: write
+
+concurrency:
+  group: werss-collect
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 拉取数据仓库(私有 werss-data)
+        env:
+          TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:${TOKEN}@github.com/${{ github.repository_owner }}/werss-data.git" \
+            werss-data || echo "::warning::数据仓库克隆失败,将以空数据启动(首次部署属正常)"
+
+      - name: 启动 WeRSS 容器
+        run: |
+          mkdir -p data
+          if [ -f werss-data/data/db.db ]; then
+            cp -r werss-data/data/. data/
+          fi
+          docker run -d --name werss -p 8001:8001 \
+            -e DB=sqlite:///data/db.db \
+            -e USERNAME="${{ secrets.WERSS_USER }}" \
+            -e PASSWORD="${{ secrets.WERSS_PASS }}" \
+            -e ENABLE_JOB=True \
+            -e WEB_NAME=WeRSS微信公众号订阅助手 \
+            -v "$GITHUB_WORKSPACE/data:/app/data" \
+            ghcr.io/rachelos/we-mp-rss:latest
+          echo "等待服务就绪..."
+          for i in $(seq 1 60); do
+            curl -sf http://localhost:8001/ >/dev/null && { echo "服务已就绪"; break; }
+            sleep 2
+          done
+
+      - name: 触发采集(遍历全部定时任务)
+        run: |
+          curl -s -X POST http://localhost:8001/api/v1/wx/auth/token \
+            -d "username=${{ secrets.WERSS_USER }}" \
+            -d "password=${{ secrets.WERSS_PASS }}" \
+            | python3 -c "import sys,json;print(json.load(sys.stdin)['access_token'])" > token.txt
+          curl -s -H "Authorization: Bearer $(cat token.txt)" \
+            http://localhost:8001/api/v1/wx/message_tasks -o tasks.json
+          python3 - <<'EOF'
+          import json, subprocess
+          token = open("token.txt").read().strip()
+          data = json.load(open("tasks.json"))
+          items = data.get("data") or []
+          if isinstance(items, dict):
+              items = items.get("list") or items.get("records") or []
+          ids = [t.get("id") for t in items if t.get("id")]
+          if not ids:
+              print("::warning::没有找到定时任务,请先在 WeRSS 界面创建消息任务")
+          for tid in ids:
+              print(f"触发采集: task {tid}")
+              subprocess.run([
+                  "curl", "-s",
+                  "-H", f"Authorization: Bearer {token}",
+                  f"http://localhost:8001/api/v1/wx/message_tasks/{tid}/run"
+              ], capture_output=True)
+          EOF
+          echo "等待采集完成(约 8 分钟)..."
+          sleep 480
+
+      - name: 导出 RSS 为静态文件
+        run: |
+          mkdir -p site/rss
+          curl -s http://localhost:8001/api/v1/wx/rss -o rss_list.json || true
+          python3 - <<'EOF'
+          import json, subprocess, pathlib, html
+          site = pathlib.Path("site/rss")
+          try:
+              data = json.load(open("rss_list.json"))
+          except Exception as e:
+              print(f"::warning::RSS 列表解析失败: {e}"); raise SystemExit(0)
+          items = data.get("data") or []
+          if isinstance(items, dict):
+              items = items.get("list") or items.get("records") or []
+          feeds = []
+          for it in items:
+              fid, name = it.get("id"), it.get("mp_name") or it.get("name") or str(it.get("id"))
+              if fid:
+                  feeds.append((str(fid), name))
+          index = ["<html><head><meta charset='utf-8'><title>WeRSS 订阅源</title></head><body><h1>WeRSS RSS 订阅源</h1><ul>"]
+          for fid, name in feeds:
+              r = subprocess.run(["curl", "-sf",
+                  f"http://localhost:8001/api/v1/wx/feed/{fid}.xml",
+                  "-o", str(site / f"{fid}.xml")])
+              if r.returncode == 0 and (site / f"{fid}.xml").stat().st_size > 0:
+                  print(f"导出: {name} -> rss/{fid}.xml")
+                  index.append(f"<li><a href='rss/{fid}.xml'>{html.escape(name)}</a> "
+                               f"(<code>rss/{fid}.xml</code>)</li>")
+          index.append("</ul></body></html>")
+          pathlib.Path("site/index.html").write_text("\n".join(index), encoding="utf-8")
+          EOF
+          ls -la site/rss || true
+
+      - name: 发布 RSS 到 gh-pages(Pages 永久在线)
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./site
+          destination_dir: rss
+          keep_files: false
+          commit_message: "RSS 更新 ${{ github.event_name }} ${{ github.run_id }}"
+        continue-on-error: true
+
+      - name: 数据写回私有仓库(持久化)
+        run: |
+          if [ -d werss-data/.git ]; then
+            cd werss-data
+            mkdir -p data
+            cp -r ../data/. data/ 2>/dev/null || true
+            git config user.name "werss-bot"
+            git config user.email "werss-bot@users.noreply.github.com"
+            git add -A
+            if git diff --cached --quiet; then
+              echo "数据无变化,跳过提交"
+            else
+              git commit -m "data sync $(date -u '+%Y-%m-%d %H:%M UTC')"
+              git push
+            fi
+          else
+            echo "::warning::数据仓库不可用,本次数据未持久化"
+          fi
